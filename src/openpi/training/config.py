@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.tienkung_policy as tienkung_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
 import openpi.training.droid_rlds_dataset as droid_rlds_dataset
@@ -352,6 +353,65 @@ class LeRobotLiberoDataConfig(DataConfigFactory):
             repack_transforms=repack_transform,
             data_transforms=data_transforms,
             model_transforms=model_transforms,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotTienkungDataConfig(DataConfigFactory):
+    """Data config for Tienkung humanoid dual-arm datasets.
+
+    The expected LeRobot dataset contains:
+    - observation.images.camera_head: single head RGB camera
+    - observation.state: 26D state, left arm 7 + left hand 6 + right arm 7 + right hand 6
+    - action: 26D action in the same order
+    """
+
+    default_prompt: str | None = None
+    use_delta_arm_actions: bool = True
+    arm_dof_per_side: int = 7
+    hand_dof_per_side: int = 6
+
+    action_sequence_keys: Sequence[str] = ("action",)
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {"camera_head": "observation.images.camera_head"},
+                        "state": "observation.state",
+                        "actions": "action",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[tienkung_policy.TienkungInputs(model_type=model_config.model_type)],
+            outputs=[tienkung_policy.TienkungOutputs()],
+        )
+
+        if self.use_delta_arm_actions:
+            delta_action_mask = _transforms.make_bool_mask(
+                self.arm_dof_per_side,
+                -self.hand_dof_per_side,
+                self.arm_dof_per_side,
+                -self.hand_dof_per_side,
+            )
+            data_transforms = data_transforms.push(
+                inputs=[_transforms.DeltaActions(delta_action_mask)],
+                outputs=[_transforms.AbsoluteActions(delta_action_mask)],
+            )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
         )
 
 
@@ -913,6 +973,34 @@ _CONFIGS = [
             ),
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_droid/params"),
+        num_train_steps=20_000,
+        batch_size=32,
+    ),
+    #
+    # Fine-tuning Tienkung humanoid configs.
+    #
+    TrainConfig(
+        name="pi05_tienkung_pick_place",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotTienkungDataConfig(
+            repo_id="0704_act_pick/pick_place",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="pick up the apple and place it",
+            use_delta_arm_actions=True,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        ema_decay=0.999,
         num_train_steps=20_000,
         batch_size=32,
     ),

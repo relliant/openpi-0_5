@@ -148,8 +148,15 @@ require_file "$REPO/scripts/train.py" "OpenPI training entry point"
 require_file "$REPO/src/openpi/training/config.py" "OpenPI training config"
 
 require_dir "$SANDBOX" "OpenPI Singularity sandbox"
-require_file "$VENV/bin/python" "OpenPI virtual-environment Python"
 
+# The venv was created inside the container. Its Python entry may be an
+# absolute symlink whose target only exists inside that container.
+if [[ ! -e "$VENV/bin/python" && ! -L "$VENV/bin/python" ]]; then
+    die "OpenPI virtual-environment Python entry not found: $VENV/bin/python"
+fi
+
+echo "OpenPI venv Python entry:"
+ls -l "$VENV/bin/python"
 require_dir "$DATASET_DIR" "LeRobot dataset"
 require_dir "$DATASET_DIR/meta" "LeRobot metadata directory"
 require_dir "$DATASET_DIR/data" "LeRobot data directory"

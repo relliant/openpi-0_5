@@ -992,7 +992,7 @@ _CONFIGS = [
             default_prompt="pick up the apple and place it",
             use_delta_arm_actions=True,
         ),
-        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        weight_loader=weight_loaders.CheckpointWeightLoader("/data-sl/lsy_ws/models/pi05_base/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(
             warmup_steps=1_000,
             peak_lr=5e-5,

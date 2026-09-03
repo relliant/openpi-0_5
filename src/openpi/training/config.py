@@ -20,6 +20,7 @@ import openpi.models.tokenizer as _tokenizer
 import openpi.policies.aloha_policy as aloha_policy
 import openpi.policies.droid_policy as droid_policy
 import openpi.policies.libero_policy as libero_policy
+import openpi.policies.rx101_policy as rx101_policy
 import openpi.policies.tienkung_policy as tienkung_policy
 import openpi.shared.download as _download
 import openpi.shared.normalize as _normalize
@@ -403,6 +404,61 @@ class LeRobotTienkungDataConfig(DataConfigFactory):
                 inputs=[_transforms.DeltaActions(delta_action_mask)],
                 outputs=[_transforms.AbsoluteActions(delta_action_mask)],
             )
+
+        model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
+
+        return dataclasses.replace(
+            self.create_base_config(assets_dirs, model_config),
+            repack_transforms=repack_transform,
+            data_transforms=data_transforms,
+            model_transforms=model_transforms,
+            action_sequence_keys=self.action_sequence_keys,
+        )
+
+
+@dataclasses.dataclass(frozen=True)
+class LeRobotRx101DataConfig(DataConfigFactory):
+    """Data config for RX blackbox humanoid (rx_p2_{27,29}dof, single ego_view camera).
+
+    Expected LeRobot v2.1 dataset fields (see meta/info.json):
+    - observation.images.ego_view: 480x640x3 video
+    - observation.state: [B]                      rx_p2 body joints (B=27 or 29)
+    - observation.left_gripper / observation.right_gripper: [1] each
+    - action.wbc: [B]                             whole-body-control targets
+    - action.left_gripper / action.right_gripper: [1] each
+
+    action_dim is the final concatenated action width used by Rx101Outputs to slice
+    the model's 32-D output back to the robot's real action space:
+      - rx_p2_27dof + 2 grippers = 29
+      - rx_p2_29dof + 2 grippers = 31
+    """
+
+    default_prompt: str | None = None
+    action_sequence_keys: Sequence[str] = ("action.wbc", "action.left_gripper", "action.right_gripper")
+    action_dim: int = 29
+
+    @override
+    def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
+        repack_transform = _transforms.Group(
+            inputs=[
+                _transforms.RepackTransform(
+                    {
+                        "images": {"ego_view": "observation.images.ego_view"},
+                        "state": "observation.state",
+                        "left_gripper_state": "observation.left_gripper",
+                        "right_gripper_state": "observation.right_gripper",
+                        "action_wbc": "action.wbc",
+                        "action_left_gripper": "action.left_gripper",
+                        "action_right_gripper": "action.right_gripper",
+                    }
+                )
+            ]
+        )
+
+        data_transforms = _transforms.Group(
+            inputs=[rx101_policy.Rx101Inputs(model_type=model_config.model_type)],
+            outputs=[rx101_policy.Rx101Outputs(action_dim=self.action_dim)],
+        )
 
         model_transforms = ModelTransformFactory(default_prompt=self.default_prompt)(model_config)
 
@@ -1012,6 +1068,94 @@ _CONFIGS = [
         ema_decay=None,
         num_train_steps=20_000,
         batch_size=16,
+    ),
+    #
+    # Fine-tuning RX101 blackbox humanoid configs.
+    #
+    TrainConfig(
+        # Full-parameter fine-tune of pi0.5 on the RX101 blackbox (rx_p2_27dof) LeRobot dataset.
+        # Point HF_LEROBOT_HOME at the parent directory that contains this repo_id, e.g.:
+        #   export HF_LEROBOT_HOME=/data/nas_ray/dataset/foundation_data/processed/lerobot/rx101_blackbox
+        # then the loader opens $HF_LEROBOT_HOME/20260825_take_book_from_bookshelf_and_hand_to_person.
+        name="pi05_rx101_blackbox",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotRx101DataConfig(
+            repo_id="20260825_take_book_from_bookshelf_and_hand_to_person",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="take the book from the bookshelf and hand it to the person",
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=30_000,
+        batch_size=32,
+        fsdp_devices=8,
+    ),
+    TrainConfig(
+        # Full-parameter fine-tune of pi0.5 on the RX2 blackbox (rx_p2_29dof) LeRobot dataset.
+        # 29 body joints + 2 grippers → action_dim=31 (Rx101Outputs slices the 32-D model output).
+        # Point HF_LEROBOT_HOME at the parent that contains this repo_id, e.g.:
+        #   export HF_LEROBOT_HOME=/data/nas_ray/dataset/foundation_data/processed/lerobot/rx2_blackbox/20260901_204326_抽屉取药-抽屉一层黑色药盒-9号
+        name="pi05_rx2_blackbox_drawer",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotRx101DataConfig(
+            repo_id="mondoRX-03_task_0016_20260901_201336_lerobot-cdf007d8-09fe-411b-90b2-0368ec7f0f5c",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="open the drawer and pick up the black medicine box",
+            action_dim=31,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=30_000,
+        batch_size=32,
+        fsdp_devices=8,
+    ),
+    TrainConfig(
+        # Same task/schema as pi05_rx2_blackbox_drawer, larger take (63 episodes / ~54k frames).
+        # Point HF_LEROBOT_HOME at the parent that contains this repo_id, e.g.:
+        #   export HF_LEROBOT_HOME=/data/nas_ray/dataset/foundation_data/processed/lerobot/rx2_blackbox/20260902_014345_抽屉取药-抽屉一层黑色药盒-9号
+        name="pi05_rx2_blackbox_drawer_v2",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotRx101DataConfig(
+            repo_id="mondoRX-03_task_0016_20260902_005106_lerobot-f3a05a7f-252a-460a-ac70-c2c2e31ce363",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="open the drawer and pick up the black medicine box",
+            action_dim=31,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=30_000,
+        batch_size=32,
+        fsdp_devices=8,
     ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.

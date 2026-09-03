@@ -1,0 +1,50 @@
+config_version: 1
+
+# openpi-0.5 full-parameter fine-tune on rx2_blackbox / drawer-medicine-pickup subset.
+# 8-GPU single-node JAX FSDP → task type `shell` (see pi05_rx101_blackbox.yaml for rationale).
+#
+# Dataset (aliyun-h100 NAS only, not cross-cloud synced):
+#   /data/nas_ray/dataset/foundation_data/processed/lerobot/rx2_blackbox/
+#     20260901_204326_抽屉取药-抽屉一层黑色药盒-9号/mondoRX-03_task_0016_..._lerobot-cdf007d8-.../
+# schema: rx_p2_29dof (state/action = 29-D body + 2 grippers = 31-D total, sliced from 32-D model output).
+
+cluster: aliyun_h100
+num_gpus: 8
+image: ai-base:starvla-cuda12.8_devel-ubuntu22.04-v5
+
+experiment_name: "pi05-rx2-blackbox-drawer"
+
+shared_workspace: /data/nas_ray/home/siyu.luo/project/openpi-0_5
+log_folder: "logs"
+
+os_env_vars:
+  # wandb online — key file lives on aliyun-h100 NAS
+  WANDB_MODE: online
+
+tasks:
+  - name: "pi05-rx2-drawer-medicine-v1"
+    type: "shell"
+    cmd: >
+      set -euxo pipefail &&
+      cd /data/nas_ray/home/siyu.luo/project/openpi-0_5 &&
+      (command -v ffmpeg || (apt-get update -qq && apt-get install -y --no-install-recommends ffmpeg)) &&
+      export PATH=$HOME/.local/bin:$PATH &&
+      (command -v uv || pip install --user uv) &&
+      git config --global url."https://gh-proxy.com/https://github.com/".insteadOf https://github.com/ &&
+      export UV_LINK_MODE=copy &&
+      GIT_LFS_SKIP_SMUDGE=1 uv sync &&
+      GIT_LFS_SKIP_SMUDGE=1 uv pip install -e . &&
+      uv pip install gsutil &&
+      export WANDB_API_KEY=$(cat /data/nas_ray/home/siyu.luo/.wandb-key) &&
+      export HF_LEROBOT_HOME='/data/nas_ray/dataset/foundation_data/processed/lerobot/rx2_blackbox/20260901_204326_抽屉取药-抽屉一层黑色药盒-9号' &&
+      export OPENPI_DATA_HOME=/data/nas_ray/home/siyu.luo/cache/openpi &&
+      export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 &&
+      unset NCCL_SOCKET_IFNAME &&
+      export NCCL_IB_DISABLE=1 &&
+      export NCCL_P2P_DISABLE=0 &&
+      NS_FILE=assets/pi05_rx2_blackbox_drawer/mondoRX-03_task_0016_20260901_201336_lerobot-cdf007d8-09fe-411b-90b2-0368ec7f0f5c/norm_stats.json &&
+      ([ -f "$NS_FILE" ] && echo "norm_stats.json present, skipping" || uv run scripts/compute_norm_stats.py --config-name pi05_rx2_blackbox_drawer) &&
+      uv run scripts/train.py pi05_rx2_blackbox_drawer
+      --exp-name={{ this.name }}
+      --checkpoint-base-dir /data/nas_ray/home/siyu.luo/project/openpi-0_5/checkpoints_rx2
+      --overwrite

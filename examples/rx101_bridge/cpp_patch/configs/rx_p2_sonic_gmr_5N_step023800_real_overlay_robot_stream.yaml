@@ -1,0 +1,41 @@
+# Overlay: run the SONIC encoder-mode-0 g1 head from a live ZMQ robot-motion stream
+# instead of the SMPL→GMR retargeter.
+#
+# Apply via:
+#   rx101_pnc --config .../rx_p2_sonic_gmr_5N_step023800_real.yaml --target robot_stream
+#
+# The base config keeps its clip fallback (`sonic_motion_clip: "motion_clips/rx_p2_walk4_ik"`)
+# and safety chain untouched. This overlay only flips the reference source.
+#
+# Contract (Bridge side): see openpi-0_5/examples/rx101_bridge/{zmq_pose.py,bridge.py}.
+# Publisher is expected to bind `tcp://*:5556` and publish `pose` messages at 50 Hz.
+# Frames are joint_pos[N,27] + joint_vel[N,27] + body_quat[N,4] wxyz + frame_index[N] i64.
+
+policy:
+  # Turn off the SMPL/GMR reference path; g1 encoder will consume live joint frames.
+  # Both flags must go together: `sonic_smpl_via_gmr` requires `sonic_enable_smpl_teleop`
+  # per robot_config.cpp validation, so shut the whole SMPL chain off.
+  sonic_enable_smpl_teleop: false
+  sonic_smpl_via_gmr: false
+
+  # New robot-native reference stream (ZMQ Protocol v1, encoder mode 0). Requires the
+  # patched md_control_rx build with RxRobotMotionZmqSubscriber + SonicRobotMotionBuffer.
+  sonic_via_robot_stream: true
+  sonic_zmq_connect_addr: "tcp://127.0.0.1:5556"
+  sonic_zmq_topic: "pose"
+  sonic_zmq_expected_dof: 27
+  # future_frame_count 10 = legacy1691 encoder input; 4 = native1187. Keep the deployed
+  # legacy1691 encoder for now (see sonic_encoder_path in the base config).
+  sonic_robot_stream_future_frames: 10
+  sonic_robot_stream_playback_delay_frames: 10
+
+policies:
+  sonic_smpl:
+    sonic_enable_smpl_teleop: false
+    sonic_smpl_via_gmr: false
+    sonic_via_robot_stream: true
+    sonic_zmq_connect_addr: "tcp://127.0.0.1:5556"
+    sonic_zmq_topic: "pose"
+    sonic_zmq_expected_dof: 27
+    sonic_robot_stream_future_frames: 10
+    sonic_robot_stream_playback_delay_frames: 10

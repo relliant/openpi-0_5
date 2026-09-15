@@ -31,6 +31,7 @@ from PIL import Image
 from openpi_client import websocket_client_policy
 from openpi_client.action_chunk_broker import ActionChunkBroker
 
+from examples.rx101_bridge import debug_dashboard
 from examples.rx101_bridge import joint_maps
 from examples.rx101_bridge import zmq_pose
 
@@ -65,7 +66,13 @@ DEFAULT_HEAD_YAW_PITCH = np.zeros(2, dtype=np.float32)  # neutral head, matches 
 # If the robot's yaml `pico_aux.head.sign` ever changes, this constant MUST change to
 # match, or head pitch will drive to the WRONG extreme. Verify with the static
 # self-check (README.md §"RX2 head/gripper direct control") before any live VLA test.
-HEAD_SIGN_YAW_PITCH = np.array([1.0, -1.0], dtype=np.float32)
+#
+# YAW flipped to -1.0 after a live VLA hardware test (2026-09-08/09): the model's raw
+# head_yaw output runs the OPPOSITE direction from this yaml-derived assumption (same
+# class of bug as GRIPPER_CLOSE_THRESHOLD_RAD above — the sign was never validated
+# against the training dataset's actual head_yaw channel, only against PicoAuxGate's
+# own command convention). Pitch was NOT reported as reversed, left at -1.0.
+HEAD_SIGN_YAW_PITCH = np.array([-1.0, -1.0], dtype=np.float32)
 
 # From the same yaml `pico_aux.grippers`. PicoAuxGate only supports binary open/close
 # (gripper_closed_mask) — VLA's continuous gripper output must be thresholded.
@@ -247,10 +254,21 @@ class Bridge:
         smoothing_alpha: float = DEFAULT_SMOOTHING_ALPHA,
         action_horizon: int = VLA_HORIZON_STEPS,
         profile: DeployProfile = PROFILE_RX101,
+        debug_chunk_log: bool = False,
+        debug_web_port: int | None = None,
     ) -> None:
         self._state = state_source
         self._prompt = prompt
         self._profile = profile
+        self._debug_chunk_log = debug_chunk_log
+        self._telemetry: debug_dashboard.TelemetryHub | None = None
+        self._debug_web_server = None
+        if debug_web_port is not None:
+            self._telemetry = debug_dashboard.TelemetryHub()
+            self._debug_web_server = debug_dashboard.make_server(self._telemetry, debug_web_port)
+            threading.Thread(target=self._debug_web_server.serve_forever,
+                             name="debug-web", daemon=True).start()
+            LOG.info("debug dashboard: http://0.0.0.0:%d/", debug_web_port)
         raw_policy = websocket_client_policy.WebsocketClientPolicy(host=vla_host, port=vla_port)
         # ActionChunkBroker: infer(obs) returns a SINGLE frame (dict, sliced along
         # the first dim of the underlying chunk).  A real VLA call happens every
@@ -268,6 +286,7 @@ class Bridge:
         self._action_lock = threading.Lock()
 
         self._prev_pub_sonic: np.ndarray | None = None   # for low-pass + finite-diff
+        self._prev_pub_head: np.ndarray | None = None    # for low-pass, head_yaw/pitch
         self._stop = threading.Event()
         self._seq = 0
         self._default_sonic = joint_maps.vla_to_sonic(DEFAULT_STAND_VLA)
@@ -303,22 +322,42 @@ class Bridge:
                     # Both grippers are always "enabled" for external control while
                     # a fresh robot_stream action is driving — PicoAuxGate's
                     # per-side closed_mask bit selects open_rad vs closed_rad.
+                    #
+                    # Comparison direction confirmed INVERTED via live hardware test
+                    # (2026-09-08): GRIPPER_OPEN_RAD/GRIPPER_CLOSED_RAD are PicoAuxGate's
+                    # own actuator command-target constants (from the robot yaml), never
+                    # validated against the actual sign of the training dataset's raw
+                    # action.left_gripper/right_gripper channel. Empirically the model's
+                    # raw output runs the OPPOSITE direction from that assumption, so we
+                    # flip the comparison here (open/close was swapped on the real robot).
                     grip_enable_mask = 0x03
                     grip_closed_mask = (
-                        (0x01 if lg > GRIPPER_CLOSE_THRESHOLD_RAD else 0)
-                        | (0x02 if rg > GRIPPER_CLOSE_THRESHOLD_RAD else 0)
+                        (0x01 if lg < GRIPPER_CLOSE_THRESHOLD_RAD else 0)
+                        | (0x02 if rg < GRIPPER_CLOSE_THRESHOLD_RAD else 0)
                     )
                 else:
                     head_yp = DEFAULT_HEAD_YAW_PITCH
                     lg = float(action[27])
                     rg = float(action[28])
+            head_yp_raw = head_yp.copy()  # pre-filter, for the debug dashboard only
 
             body_sonic = joint_maps.vla_to_sonic(body_vla).astype(np.float32)
+            if self._debug_chunk_log:
+                # Raw (pre-filter) VLA elbow output, VLA_ORDER idx 18=l_elbow, 24=r_elbow.
+                # Diagnostic for the chunk-boundary "snap back" hypothesis — compare
+                # against the FILTERED body_sonic logged right below across chunk edges.
+                LOG.info("CHUNKDBG seq=%d t=%.3f raw_l_elbow=%.4f raw_r_elbow=%.4f",
+                         self._seq, time.monotonic(), body_vla[18], body_vla[24])
             # Low-pass filter against previously published SONIC-order pose. Damps
             # step discontinuities at chunk boundaries and any VLA jitter.
             if self._prev_pub_sonic is not None:
                 body_sonic = (self._alpha * body_sonic
                               + (1.0 - self._alpha) * self._prev_pub_sonic)
+            if self._debug_chunk_log:
+                # body_sonic SONIC_POLICY_ORDER idx 21=l_elbow, 22=r_elbow (see
+                # static_publisher.py DEFAULT_STAND_SONIC comment for the full layout).
+                LOG.info("CHUNKDBG seq=%d t=%.3f pub_l_elbow=%.4f pub_r_elbow=%.4f",
+                         self._seq, time.monotonic(), body_sonic[21], body_sonic[22])
             # Velocity is derivative of what we PUBLISH (filtered), not of raw VLA output.
             if self._prev_pub_sonic is None:
                 joint_vel_sonic = np.zeros(27, dtype=np.float32)
@@ -326,20 +365,44 @@ class Bridge:
                 joint_vel_sonic = ((body_sonic - self._prev_pub_sonic) / SONIC_DT_S
                                    ).astype(np.float32)
             self._prev_pub_sonic = body_sonic.copy()
+            state_now = self._state.read()
 
             payload = {
                 "joint_pos":   body_sonic[None, :],                             # (1, 27)
                 "joint_vel":   joint_vel_sonic[None, :],                        # (1, 27)
-                "body_quat":   self._state.read().root_quat_wxyz[None, :],      # (1, 4) wxyz
+                "body_quat":   state_now.root_quat_wxyz[None, :],               # (1, 4) wxyz
                 "frame_index": np.array([self._seq], dtype=np.int64),           # (1,)
             }
             if self._profile.has_head:
+                # Low-pass filter, same as body_sonic above. head_yp is raw VLA output
+                # (only sign-cancelled below) and is subject to the same chunk-boundary
+                # jitter as the arms; unlike the arms it was never smoothed, which showed
+                # up directly as head oscillation on hardware (2026-09-10).
+                if self._prev_pub_head is not None:
+                    head_yp = (self._alpha * head_yp
+                               + (1.0 - self._alpha) * self._prev_pub_head)
+                self._prev_pub_head = head_yp.copy()
                 # Sign-cancellation trick — see HEAD_SIGN_YAW_PITCH comment above.
                 head_wire = (HEAD_SIGN_YAW_PITCH * head_yp).astype(np.float32)
                 payload["head_yaw"] = np.array([head_wire[0]], dtype=np.float32)
                 payload["head_pitch"] = np.array([head_wire[1]], dtype=np.float32)
                 payload["gripper_enable_mask"] = np.array([grip_enable_mask], dtype=np.uint8)
                 payload["gripper_closed_mask"] = np.array([grip_closed_mask], dtype=np.uint8)
+            if self._telemetry is not None:
+                self._telemetry.publish({
+                    "t": time.monotonic(),
+                    "seq": self._seq,
+                    "raw": body_vla.tolist(),
+                    "pub": body_sonic[joint_maps.SONIC_TO_VLA].tolist(),
+                    "act": state_now.joint_pos.tolist(),
+                    "head_raw": head_yp_raw.tolist() if self._profile.has_head else None,
+                    "head_pub": head_yp.tolist() if self._profile.has_head else None,
+                    "head_act": state_now.head_yaw_pitch.tolist() if self._profile.has_head else None,
+                    "grip_raw": [lg, rg],
+                    "grip_closed_mask": int(grip_closed_mask),
+                    "grip_act": [state_now.left_gripper_pos, state_now.right_gripper_pos],
+                    "quat_act": state_now.root_quat_wxyz.tolist(),
+                })
             self._publisher.send(payload)
             self._seq += 1
 
@@ -425,6 +488,15 @@ def main() -> None:
                     help="Checkpoint body layout: rx101 (27-dof, no head) or "
                          "rx2 (29-dof, head+gripper direct control via PicoAuxGate).")
     ap.add_argument("--mock-state", action="store_true", help="use MockStateSource (no real robot).")
+    ap.add_argument("--debug-chunk-log", action="store_true",
+                    help="Log raw (pre-filter) vs published (filtered) l/r_elbow every publish "
+                         "tick, tagged with seq + monotonic time. Diagnostic for the action-chunk "
+                         "'snap back' hypothesis (see ActionChunkBroker) — off by default, no "
+                         "behavior change, just extra log volume.")
+    ap.add_argument("--debug-web-port", type=int, default=None,
+                    help="If set, serve a live model-vs-actual telemetry dashboard at "
+                         "http://<this-host>:<port>/ (see debug_dashboard.py). Off by default; "
+                         "read-only, cannot affect the control loop.")
     args = ap.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(threadName)s] %(message)s")
 
@@ -443,6 +515,8 @@ def main() -> None:
             smoothing_alpha=args.smoothing_alpha,
             action_horizon=args.action_horizon,
             profile=PROFILES[args.profile],
+            debug_chunk_log=args.debug_chunk_log,
+            debug_web_port=args.debug_web_port,
         ).run()
     finally:
         close = getattr(state, "close", None)

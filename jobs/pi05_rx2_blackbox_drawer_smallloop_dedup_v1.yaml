@@ -1,0 +1,55 @@
+config_version: 1
+
+# openpi-0.5 full-parameter fine-tune on the deduped merge of the manually-reviewed
+# "小回环" (small-loop) drawer-medicine batches: added60 + added22 + added57 +
+# medicine_added214_0910 (see scripts/merge_rx2_drawer_smallloop.py).
+# 300 unique episodes / 211962 frames. added128/added156 excluded per review
+# (robot 12 loop too small / robot 13 not approved). The "大回环" (big-loop) batches
+# (reviewed248/robot1_44/robot12_118) could not be located under rx2_blackbox as of
+# 2026-09-14 — the only 248-episode dir found is unrelated book/battery task data — so
+# there is no separate "big-loop + straight-line" job for now.
+# 8-GPU single-node JAX FSDP → task type `shell`.
+#
+# Dataset (aliyun-h100 NAS, home dir — physically merged, not a foundation_data snapshot):
+#   /data/nas_ray/home/siyu.luo/data/lerobot/rx2_blackbox_drawer_merged/rx2_drawer_medicine_smallloop_dedup_v1/
+# schema: rx_p2_29dof (state/action = 29-D body + 2 grippers = 31-D total).
+
+cluster: aliyun_h100
+num_gpus: 8
+image: ai-base:starvla-cuda12.8_devel-ubuntu22.04-v5
+
+experiment_name: "pi05-rx2-blackbox-drawer-smallloop-dedup-v1"
+
+shared_workspace: /data/nas_ray/home/siyu.luo/project/openpi-0_5
+log_folder: "logs"
+
+os_env_vars:
+  WANDB_MODE: online
+
+tasks:
+  - name: "pi05-rx2-drawer-medicine-smallloop-dedup-v1"
+    type: "shell"
+    cmd: >
+      set -euxo pipefail &&
+      cd /data/nas_ray/home/siyu.luo/project/openpi-0_5 &&
+      (command -v ffmpeg || (apt-get update -qq && apt-get install -y --no-install-recommends ffmpeg)) &&
+      export PATH=$HOME/.local/bin:$PATH &&
+      (command -v uv || pip install --user uv) &&
+      git config --global url."https://gh-proxy.com/https://github.com/".insteadOf https://github.com/ &&
+      export UV_LINK_MODE=copy &&
+      GIT_LFS_SKIP_SMUDGE=1 uv sync &&
+      GIT_LFS_SKIP_SMUDGE=1 uv pip install -e . &&
+      uv pip install gsutil &&
+      export WANDB_API_KEY=$(cat /data/nas_ray/home/siyu.luo/.wandb-key) &&
+      export HF_LEROBOT_HOME=/data/nas_ray/home/siyu.luo/data/lerobot/rx2_blackbox_drawer_merged &&
+      export OPENPI_DATA_HOME=/data/nas_ray/home/siyu.luo/cache/openpi &&
+      export XLA_PYTHON_CLIENT_MEM_FRACTION=0.9 &&
+      unset NCCL_SOCKET_IFNAME &&
+      export NCCL_IB_DISABLE=1 &&
+      export NCCL_P2P_DISABLE=0 &&
+      NS_FILE=assets/pi05_rx2_blackbox_drawer_smallloop_dedup_v1/rx2_drawer_medicine_smallloop_dedup_v1/norm_stats.json &&
+      ([ -f "$NS_FILE" ] && echo "norm_stats.json present, skipping" || uv run scripts/compute_norm_stats.py --config-name pi05_rx2_blackbox_drawer_smallloop_dedup_v1) &&
+      uv run scripts/train.py pi05_rx2_blackbox_drawer_smallloop_dedup_v1
+      --exp-name={{ this.name }}
+      --checkpoint-base-dir /data/nas_ray/home/siyu.luo/project/openpi-0_5/checkpoints_rx2
+      --overwrite

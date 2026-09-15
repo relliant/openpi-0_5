@@ -1157,6 +1157,73 @@ _CONFIGS = [
         batch_size=32,
         fsdp_devices=8,
     ),
+    TrainConfig(
+        # Deduped merge of all "抽屉取药-抽屉一层黑色药盒-9号" rx2_blackbox snapshot exports
+        # (cdf007d8 / f3a05a7f / af5fc6a2 / a1b363eb), keyed by sortie id via
+        # scripts/merge_rx2_drawer_dedup.py — 95 unique episodes / 78566 frames (vs. 63/54362
+        # for the single-snapshot pi05_rx2_blackbox_drawer_v2). The 4 source snapshots overlap
+        # heavily (same sorties re-exported at different times); naively concatenating them would
+        # duplicate ~30% of episodes.
+        # Point HF_LEROBOT_HOME at the parent that contains this repo_id, e.g.:
+        #   export HF_LEROBOT_HOME=/data/nas_ray/home/siyu.luo/data/lerobot/rx2_blackbox_drawer_merged
+        name="pi05_rx2_blackbox_drawer_dedup_v1",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotRx101DataConfig(
+            repo_id="rx2_drawer_medicine_dedup_v1",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="open the drawer and pick up the black medicine box",
+            action_dim=31,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=30_000,
+        batch_size=32,
+        fsdp_devices=8,
+    ),
+    TrainConfig(
+        # Deduped merge of the manually-reviewed "小回环" (small-loop) drawer-medicine batches:
+        # added60 + added22 + added57 + medicine_added214_0910, via
+        # scripts/merge_rx2_drawer_smallloop.py — 300 unique episodes / 211962 frames (from 353
+        # raw episode files; added60/added57 shared 53 identical videos). added128 (robot 12,
+        # loop too small) and added156 (robot 13, not approved) are excluded per manual review.
+        # This export schema has no action.wbc field — the merge script derives it (+ grippers)
+        # from action.robot_motion_head_gripper_h0[:, :29]/[35:36]/[36:37].
+        # Point HF_LEROBOT_HOME at the parent that contains this repo_id, e.g.:
+        #   export HF_LEROBOT_HOME=/data/nas_ray/home/siyu.luo/data/lerobot/rx2_blackbox_drawer_merged
+        name="pi05_rx2_blackbox_drawer_smallloop_dedup_v1",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotRx101DataConfig(
+            repo_id="rx2_drawer_medicine_smallloop_dedup_v1",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="open the drawer and pick up the black medicine box",
+            action_dim=31,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=30_000,
+        batch_size=32,
+        fsdp_devices=8,
+    ),
     #
     # ALOHA Sim configs. This config is used to demonstrate how to train on a simple simulated environment.
     #

@@ -404,7 +404,37 @@ ssh rx101 'sudo systemctl stop rx101-pnc-zmq'   # 原厂 rx101-pnc.service 因 C
 | `--zmq-bind` | `tcp://*:5556` | ZMQ pub bind |
 | `--smoothing-alpha` | `0.3` | 低通：`output = α·new + (1-α)·prev`。**小 = 更平滑但滞后大** |
 | `--action-horizon` | `16` | broker chunk 长度（必须匹配训练时的 `action_horizon`） |
+| `--profile` | `rx101` | 关节布局：`rx101`（27dof 无头）或 `rx2`（29dof，头+夹爪直控） |
 | `--mock-state` | off | 用假 obs，网络冒烟用 |
+| `--debug-chunk-log` | off | 每 tick 打印原始/发布后的 l/r_elbow（chunk 边界抖动排查用），只加日志量，不改行为 |
+| `--debug-web-port` | 不启用 | 见下方"实时诊断仪表盘" |
+
+### 实时诊断仪表盘（`--debug-web-port`，见 `debug_dashboard.py`）
+
+纯只读、不影响控制环路。加这个参数即可：
+
+```bash
+ssh rx101b '
+  cd ~/rx101_bridge
+  nohup python3 bridge.py \
+      --profile rx2 --prompt "open the drawer and pick up the black medicine box" \
+      --debug-web-port 8765 \
+      > /tmp/bridge.log 2>&1 &
+'
+```
+
+然后在**和机器人同一局域网**的浏览器里直接打开：
+
+```
+http://<机器人IP>:<port>/          # 例如 http://10.0.33.164:8765/
+```
+
+不需要 SSH 隧道。页面内容：
+- 顶部大图 + 关节下拉框：选一个关节看 raw（模型原始输出）/ pub（低通滤波后发布值）/ actual（机器人编码器反馈）三条曲线的细节对比
+- "all joints" 网格：27 个 body 关节 + head_yaw/head_pitch，全部同时显示小图，一眼扫全身
+- 下方数字读数：夹爪 raw/阈值判断/实际位置，以及机器人当前实际 yaw/roll（从 body_quat 反算）
+
+端口若被占用（比如机器人上 `md_blackbox` 占了 8080），换一个端口即可，比如 `8765`。
 
 ### Overlay yaml (`rx_p2_sonic_gmr_5N_step023800_real_overlay_robot_stream.yaml`)
 

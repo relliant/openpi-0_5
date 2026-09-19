@@ -24,19 +24,30 @@ class Rx101Inputs(transforms.DataTransformFn):
     - images: {"ego_view": image}
     - state: [B]  (B=27 or 29 body joints)
     - left_gripper_state / right_gripper_state: [1] each
+    - projected_gravity: [3]  (only if include_projected_gravity; see LeRobotRx101DataConfig)
     - action_wbc: [action_horizon, B]  (only during training)
     - action_left_gripper / action_right_gripper: [action_horizon, 1] each
 
-    The B body joints + 2 grippers are concatenated into a (B+2)-D vector (29 or 31).
+    The B body joints + 2 grippers are concatenated into a (B+2)-D vector (29 or 31),
+    unless include_projected_gravity: then head_yaw/head_pitch are dropped from `state`
+    and projected_gravity(3) takes their place — body[:27] + gravity(3) + grippers(2)
+    = 32, matching the model's hard-capped proprio width (see LeRobotRx101DataConfig's
+    include_projected_gravity docstring for why).
     """
 
     model_type: _model.ModelType
+    include_projected_gravity: bool = False
 
     def __call__(self, data: dict) -> dict:
         body_state = np.asarray(data["state"], dtype=np.float32)
         left_g = np.asarray(data["left_gripper_state"], dtype=np.float32).reshape(-1)
         right_g = np.asarray(data["right_gripper_state"], dtype=np.float32).reshape(-1)
-        state = np.concatenate([body_state, left_g, right_g], axis=-1)
+        if self.include_projected_gravity:
+            body_state = body_state[:27]
+            gravity = np.asarray(data["projected_gravity"], dtype=np.float32).reshape(-1)
+            state = np.concatenate([body_state, gravity, left_g, right_g], axis=-1)
+        else:
+            state = np.concatenate([body_state, left_g, right_g], axis=-1)
 
         ego = _parse_image(data["images"]["ego_view"])
 

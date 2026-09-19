@@ -426,37 +426,55 @@ class LeRobotRx101DataConfig(DataConfigFactory):
     - observation.left_gripper / observation.right_gripper: [1] each
     - action.wbc: [B]                             whole-body-control targets
     - action.left_gripper / action.right_gripper: [1] each
+    - observation.projected_gravity: [3]          gravity in body frame (only if include_projected_gravity)
 
     action_dim is the final concatenated action width used by Rx101Outputs to slice
     the model's 32-D output back to the robot's real action space:
       - rx_p2_27dof + 2 grippers = 29
       - rx_p2_29dof + 2 grippers = 31
+
+    include_projected_gravity: the model's proprio/state width is hard-capped at
+    action_dim=32 (Pi0Config) — there's no room to just append new features. rx2
+    checkpoints trained with B=29 (27 body + 2 head) already use 29+2=31 of that
+    budget. To add balance signal, Rx101Inputs DROPS head_yaw/head_pitch (yaw
+    doesn't affect balance; pitch/roll is already covered by the gravity vector)
+    and adds `projected_gravity` (3) instead of the full root_orientation quat (4)
+    — yaw is redundant for balance and the head loss is minor (recoverable from
+    vision) — net state = body[:27] + gravity(3) + grippers(2) = 32, fits exactly.
+    Root-caused 2026-09-15: rx2 checkpoints trained without ANY orientation/gravity
+    signal despite the raw LeRobot parquet having it, leaving the model with no
+    explicit balance context — the likely cause of persistent forward-lean on
+    hardware for pi05_rx2_blackbox_drawer_smallloop_dedup_v1. Default False so
+    existing configs (whose datasets may not have this column) are unaffected.
     """
 
     default_prompt: str | None = None
     action_sequence_keys: Sequence[str] = ("action.wbc", "action.left_gripper", "action.right_gripper")
     action_dim: int = 29
+    include_projected_gravity: bool = False
 
     @override
     def create(self, assets_dirs: pathlib.Path, model_config: _model.BaseModelConfig) -> DataConfig:
-        repack_transform = _transforms.Group(
-            inputs=[
-                _transforms.RepackTransform(
-                    {
-                        "images": {"ego_view": "observation.images.ego_view"},
-                        "state": "observation.state",
-                        "left_gripper_state": "observation.left_gripper",
-                        "right_gripper_state": "observation.right_gripper",
-                        "action_wbc": "action.wbc",
-                        "action_left_gripper": "action.left_gripper",
-                        "action_right_gripper": "action.right_gripper",
-                    }
-                )
-            ]
-        )
+        repack_dict = {
+            "images": {"ego_view": "observation.images.ego_view"},
+            "state": "observation.state",
+            "left_gripper_state": "observation.left_gripper",
+            "right_gripper_state": "observation.right_gripper",
+            "action_wbc": "action.wbc",
+            "action_left_gripper": "action.left_gripper",
+            "action_right_gripper": "action.right_gripper",
+        }
+        if self.include_projected_gravity:
+            repack_dict["projected_gravity"] = "observation.projected_gravity"
+        repack_transform = _transforms.Group(inputs=[_transforms.RepackTransform(repack_dict)])
 
         data_transforms = _transforms.Group(
-            inputs=[rx101_policy.Rx101Inputs(model_type=model_config.model_type)],
+            inputs=[
+                rx101_policy.Rx101Inputs(
+                    model_type=model_config.model_type,
+                    include_projected_gravity=self.include_projected_gravity,
+                )
+            ],
             outputs=[rx101_policy.Rx101Outputs(action_dim=self.action_dim)],
         )
 
@@ -1211,6 +1229,44 @@ _CONFIGS = [
             base_config=DataConfig(prompt_from_task=False),
             default_prompt="open the drawer and pick up the black medicine box",
             action_dim=31,
+        ),
+        weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
+        lr_schedule=_optimizer.CosineDecaySchedule(
+            warmup_steps=1_000,
+            peak_lr=5e-5,
+            decay_steps=1_000_000,
+            decay_lr=5e-5,
+        ),
+        optimizer=_optimizer.AdamW(clip_gradient_norm=1.0),
+        num_train_steps=30_000,
+        batch_size=32,
+        fsdp_devices=8,
+    ),
+    TrainConfig(
+        # Same dataset as pi05_rx2_blackbox_drawer_smallloop_dedup_v1 (300 episodes / 211962
+        # frames), but with include_projected_gravity=True — see the
+        # LeRobotRx101DataConfig.include_projected_gravity docstring for the full root-cause
+        # writeup (2026-09-15 deployment finding: rx2 checkpoints trained with zero
+        # orientation/gravity signal despite the raw data having it, leaving the model with no
+        # explicit balance context; likely cause of persistent forward-lean on hardware).
+        # New state layout: body[:27] (drops head_yaw/head_pitch) + projected_gravity(3) +
+        # grippers(2) = 32 — fits the model's hard-capped proprio width without changing
+        # action_dim, so the pretrained pi05_base checkpoint's state_proj/action_*_proj weights
+        # still load cleanly. Needs a fresh norm_stats computation (new state composition) —
+        # this TrainConfig's distinct `name` already scopes assets_dirs separately from the
+        # non-gravity config, so there's no norm_stats collision.
+        name="pi05_rx2_blackbox_drawer_smallloop_gravity_v1",
+        model=pi0_config.Pi0Config(
+            pi05=True,
+            action_dim=32,
+            action_horizon=16,
+        ),
+        data=LeRobotRx101DataConfig(
+            repo_id="rx2_drawer_medicine_smallloop_dedup_v1",
+            base_config=DataConfig(prompt_from_task=False),
+            default_prompt="open the drawer and pick up the black medicine box",
+            action_dim=31,
+            include_projected_gravity=True,
         ),
         weight_loader=weight_loaders.CheckpointWeightLoader("gs://openpi-assets/checkpoints/pi05_base/params"),
         lr_schedule=_optimizer.CosineDecaySchedule(

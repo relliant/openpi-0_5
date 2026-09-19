@@ -396,7 +396,11 @@ class Bridge:
                     "pub": body_sonic[joint_maps.SONIC_TO_VLA].tolist(),
                     "act": state_now.joint_pos.tolist(),
                     "head_raw": head_yp_raw.tolist() if self._profile.has_head else None,
-                    "head_pub": head_yp.tolist() if self._profile.has_head else None,
+                    # head_wire (NOT head_yp) is what's actually on the wire — head_yp is
+                    # pre-sign-flip. Comparing head_yp against head_act (raw MCU feedback,
+                    # a THIRD convention) made an intentional, correct sign flip look like
+                    # a bug (found 2026-09-15, rx101c step052800 test).
+                    "head_pub": head_wire.tolist() if self._profile.has_head else None,
                     "head_act": state_now.head_yaw_pitch.tolist() if self._profile.has_head else None,
                     "grip_raw": [lg, rg],
                     "grip_closed_mask": int(grip_closed_mask),
